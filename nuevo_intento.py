@@ -5,7 +5,6 @@ from dipy.tracking.streamline import Streamlines
 from dipy.io.stateful_tractogram import StatefulTractogram, Space
 
 # 1. Cargar datos de la máscara y de direcciones
-
 archivo_mascara = "ISMRM_2023_b3000_mask.nii"
 archivo_picos = "/home/paulinabr/Escritorio/Tesis/Picos archivos/peaks_correcto.nii.gz"
 archivo_dwi = "ISMRM_2023_b3000.nii"
@@ -20,13 +19,12 @@ print(f"Dimensiones de picos: {picos.shape}")
 print(f"Dimensiones de máscara: {mascara.shape}")
 print(f"Dimensiones de los datos dwi: {dwi_datos.shape}")
 
-# 2. Obtener la semilla de inicio
+# 2. Funciones para seleccionar y analizar semilla de inicio
 
 coordenadas = np.argwhere(mascara == 1)
 semillas_exploradas = set()
 
 def seleccionar_semilla_valida(coordenadas, peaks, mascara, semillas_exploradas, max_intentos=100):
-    
     for _ in range(max_intentos):
         semilla = coordenadas[np.random.randint(0, len(coordenadas))]
         if tuple(semilla) in semillas_exploradas:
@@ -36,26 +34,21 @@ def seleccionar_semilla_valida(coordenadas, peaks, mascara, semillas_exploradas,
             return semilla
     return None  # Si no encuentra una válida
 
-
-# 3. Analizar características de la semilla seleccionada
-
 def analizar_semilla(semilla, picos, mascara):
-    x,y,z = semilla
+    x, y, z = semilla
     print(f"Analizando semilla en posición: {semilla}")
 
-    #Verificar que esté dentro de la máscara
-    
-    if mascara[x,y,z] == 0:
+    # Verificar que esté dentro de la máscara
+
+    if mascara[x, y, z] == 0:
         print("La semilla está FUERA de la máscara")
         return False
     else:
         print("La semilla está dentro de la máscara")
 
     # Obtener vectores de dirección en la semilla
-
-    direcciones = picos[x,y,z]
+    direcciones = picos[x, y, z]
     normas = np.linalg.norm(direcciones, axis=1)
-
     print(f"Vectores en la semilla: \n{direcciones}")
     print(f"Normas de los vectores: {normas}")
 
@@ -64,91 +57,82 @@ def analizar_semilla(semilla, picos, mascara):
     if np.all(normas < 1e-3):
         print("Todos los vectores tienen normas muy bajas, no es una buena semilla")
         return False
-    else:
-        print("La semilla tiene vectores con normas adecuadas")
-
+   
     # Revisar si al menos un vecino tiene buenos vectores
-    
+
     vecinos_validos = 0
     for dx in [-1, 0, 1]:
         for dy in [-1, 0, 1]:
             for dz in [-1, 0, 1]:
-                if dx == dy == dz == 0:  # Saltar la semilla misma
+                if dx == dy == dz == 0: 
                     continue
                 nx, ny, nz = x + dx, y + dy, z + dz
                 if 0 <= nx < picos.shape[0] and 0 <= ny < picos.shape[1] and 0 <= nz < picos.shape[2]:
                     norm_vecino = np.linalg.norm(picos[nx, ny, nz], axis=1)
                     if np.any(norm_vecino > 1e-3):
                         vecinos_validos += 1
-
+    
     print(f"Vecinos con vectores fuertes: {vecinos_validos}/26")
     if vecinos_validos == 0:
-        print("Ningun vecino tiene vector valido, la trayectoria no puede continuar")
-
+        print("Ningún vecino tiene vector válido, la trayectoria no puede continuar")
         return False
+    return True
 
-semilla = seleccionar_semilla_valida(coordenadas,picos,mascara,semillas_exploradas)
-
-if not analizar_semilla(semilla, picos, mascara):
-    print("Buscando una nueva semilla...")
-    semilla = seleccionar_semilla_valida(np.argwhere(mascara == 1), picos, mascara,semillas_exploradas)
-    if semilla is None:
-        print("No se encontraron semillas válidas después de múltiples intentos.")
-        exit()
-    
 # 3. Definir parámetros
 
-semilla_actual = semilla #Iniciar desde la semilla seleccionada
-trayectoria = []    #Guardar puntos recorridos
-semillas_exploradas = set() #Evitar que se repitan las semillas exploradas
-max_intentos = 10 # busqueda de voxel
-intentos = 0
-longitud_minima = 10  # Longitud mínima del strln en mm
-longitud_acumulada = 0
-longitud_maxima = 20
-paso_maximo = 100 #máxima cantidad de pasos
-tamaño_paso = 0.5  #Tamaño de cada paso
-angulo_maximo = 60  # angulo máximo entre vectores
+# Iniciar desde la semilla seleccionada
 
-# 4. Calcular el angulo entre vectores
+semilla_actual = seleccionar_semilla_valida(coordenadas, picos, mascara, semillas_exploradas)
+if semilla_actual is None or not analizar_semilla(semilla_actual, picos, mascara):
+    print("No se encontró una semilla válida en los intentos iniciales.")
+    exit()
 
+# Parámetros para propagación
+tamaño_paso = 0.5    # Tamaño de cada paso 
+angulo_maximo = 60   # Ángulo máximo entre pasos (en grados)
+longitud_minima = 10 # Longitud mínima (mm)
+longitud_maxima = 20 # Longitud máxima (mm)
+max_pasos = 500      # Número máximo de pasos
+
+# 4. Calcular el ángulo entre vectores
 def calcular_angulo(v1, v2):
     cos_angulo = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
     return np.degrees(np.arccos(np.clip(cos_angulo, -1, 1)))
 
-# 5. Interpolación de los vectores
-
+# 5. Interpolación de direcciones
 def interpolar_direcciones(peaks, posicion):
     x, y, z = posicion
     x0, y0, z0 = int(x), int(y), int(z)
 
-    # Asegurar que estamos dentro del volumen
+    # Asegurar que estemos dentro del volumen
     if not (0 <= x0 < peaks.shape[0] - 1 and 0 <= y0 < peaks.shape[1] - 1 and 0 <= z0 < peaks.shape[2] - 1):
         return None
-    
-    # Extraer vecinos
+
+    #Extraer vecinos
     vecinos = peaks[x0:x0+2, y0:y0+2, z0:z0+2]
 
-    # Extraer eigenvector principal
+
+    #Extraer eigenvector principal
     norm = np.linalg.norm(vecinos, axis=-1)
     max_indices = np.argmax(norm, axis=-1)
-
     vectores_principales = np.zeros((2,2,2,3))
     for i in range(2):
         for j in range(2):
             for k in range(2):
                 vectores_principales[i,j,k] = vecinos[i,j,k, max_indices[i,j,k]]
-
+    
+    
     if np.all(np.linalg.norm(vectores_principales, axis=-1) == 0):
-        print(f"⚠️ Advertencia: Todos los eigenvectores en {posicion} son cero. Probando alternativa.")
-        
-        # Nueva estrategia: elegir el vector con la norma más alta de la semilla
+        print(f"Advertencia: Todos los eigenvectores en {posicion} son cero. Probando alternativa.")
         normas = np.linalg.norm(peaks[x0, y0, z0], axis=1)
+        
+        #Elegir el vector con la norma más alta de la semilla
         if np.max(normas) > 1e-3:
             mejor_direccion = peaks[x0, y0, z0, np.argmax(normas)]
             return mejor_direccion / np.linalg.norm(mejor_direccion)
+        
+        return None #Si tampoco hay vectores validos, no continuar
 
-        return None  # Si tampoco hay vectores válidos, no continuar
 
     # Interpolación ponderada
     pesos = np.array([
@@ -163,155 +147,131 @@ def interpolar_direcciones(peaks, posicion):
     ]).reshape(2,2,2,1)
 
     direccion_interpolada = np.sum(vectores_principales * pesos, axis=(0, 1, 2))
-
+    
     if np.linalg.norm(direccion_interpolada) > 0:
         return direccion_interpolada / np.linalg.norm(direccion_interpolada)
-
     return None
 
-    
+# 6. Funciones para propagación bidireccional
 
-# 6. Funcion para la  trayectoria 
-def realizar_trayectoria(peaks, semilla, dwi_affine, tamaño_paso, angulo_maximo, longitud_maxima, mascara):
-    """
-    Genera una trayectoria desde una semilla siguiendo las direcciones en peaks.
-    """
-    trayectoria = [semilla]
+def propagar_trayectoria(peaks, semilla, dwi_affine, tamaño_paso, angulo_maximo, max_pasos, mascara, invertir=False):
+    
+    #Generar una trayectoria desde una semilla siguiendo las direcciones de peaks
+
+    trayectoria = [semilla]  # La semilla se puede guardar como punto inicial (continuo)
+    # Iniciar con la semilla convertida a float
     posicion_actual = np.array(semilla, dtype=float)
-    longitud_acumulada = 0
     direccion_actual = None
-    max_pasos = 500
 
     for _ in range(max_pasos):
-        # Obtener dirección interpolada en la posición actual
-        direccion_interpolada = interpolar_direcciones(peaks, np.round(posicion_actual).astype(int))
-
-        # Si no se encontró dirección válida, probar otro vector en la misma semilla
-        if direccion_interpolada is None:
-            print(f"⚠️ No se encontró dirección válida en {posicion_actual}. Probando otro vector.")
-            normas = np.linalg.norm(peaks[tuple(np.round(posicion_actual).astype(int))], axis=1)
-            if np.max(normas) > 1e-3:
-                mejor_direccion = peaks[tuple(np.round(posicion_actual).astype(int))][np.argmax(normas)]
-                direccion_interpolada = mejor_direccion / np.linalg.norm(mejor_direccion)
-            else:
-                print(f"No hay direcciones válidas en {posicion_actual}. Deteniendo propagación.")
-                break
-
-        # Verificar ángulo con la dirección anterior
-        if direccion_actual is not None:
-            angulo = calcular_angulo(direccion_actual, direccion_interpolada)
-            if angulo > angulo_maximo:
-                print(f"Ángulo {angulo:.2f}° excede el umbral en {posicion_actual}. Intentando otro paso.")
-                continue  # Intentar otro paso sin detener la propagación
-
-        # Calcular el siguiente punto en la trayectoria
-        nuevo_punto = posicion_actual + tamaño_paso * direccion_interpolada
-        nuevo_voxel = np.round(nuevo_punto).astype(int).flatten()
-
-        # Validar si el nuevo voxel es válido dentro de la máscara
-        if not (0 <= nuevo_voxel[0] < mascara.shape[0] and
-                0 <= nuevo_voxel[1] < mascara.shape[1] and
-                0 <= nuevo_voxel[2] < mascara.shape[2]) or mascara[tuple(nuevo_voxel)] == 0:
-            print(f"El punto {nuevo_voxel} está fuera de la máscara o volumen. Ajustando paso.")
-            tamaño_paso *= 0.9  # Reducir tamaño de paso y volver a intentar
-            continue
-
-        # Calcular distancia física entre puntos
-        punto_fisico_actual = nib.affines.apply_affine(dwi_affine, posicion_actual)
-        punto_fisico_nuevo = nib.affines.apply_affine(dwi_affine, nuevo_voxel)
-        distancia = np.linalg.norm(punto_fisico_nuevo - punto_fisico_actual)
-
-        # Si la distancia es menor a un umbral, ajustar el tamaño del paso
-        if distancia < 0.1:
-            tamaño_paso *= 1.1  # Aumentar tamaño de paso si es muy pequeño
-            continue  # Reintentar con un paso más grande
-
-        # Verificar si la trayectoria alcanza la longitud máxima
-        if longitud_acumulada + distancia > longitud_maxima:
-            print(f"Longitud máxima alcanzada: {longitud_acumulada+distancia:.2f} mm. Terminando streamline.")
+        # Usar la posición continua para la interpolación
+        direccion = interpolar_direcciones(peaks, posicion_actual)
+        if direccion is None:
             break
 
-        # Actualizar trayectoria
-        longitud_acumulada += distancia
-        trayectoria.append(nuevo_voxel.tolist())
-        posicion_actual = nuevo_voxel
-        direccion_actual = direccion_interpolada  # Guardar la nueva dirección
+        # Verificar la bidireccionalidad
+        if invertir:
+            direccion = -direccion
+        
+        #Verificar ángulo con la dirección anterior
+        if direccion_actual is not None:
+            angulo = calcular_angulo(direccion_actual, direccion)
+            if angulo > angulo_maximo:
+                break
 
-    return trayectoria, longitud_acumulada
+        # Actualizar la posición en coordenadas continuas
+        nuevo_punto = posicion_actual + tamaño_paso * direccion
 
+        # Validar si el nuevo voxel es valido dentro de la máscada
+        nuevo_voxel = np.round(nuevo_punto).astype(int)
+        if not (0 <= nuevo_voxel[0] < mascara.shape[0] and 
+                0 <= nuevo_voxel[1] < mascara.shape[1] and 
+                0 <= nuevo_voxel[2] < mascara.shape[2]) or mascara[tuple(nuevo_voxel)] == 0:
+            break
+        # Guardar el punto continuo para mantener la suavidad de la trayectoria
+        trayectoria.append(nuevo_punto.tolist())
+        posicion_actual = nuevo_punto
+        direccion_actual = direccion
+    return trayectoria
+
+def realizar_trayectoria_bidireccional(peaks, semilla, dwi_affine, tamaño_paso, angulo_maximo, max_pasos, mascara):
+   #propagar en ambas direcciones
+    trayectoria_forward = propagar_trayectoria(peaks, semilla, dwi_affine, tamaño_paso, angulo_maximo, max_pasos, mascara, invertir=False)
+    trayectoria_backward = propagar_trayectoria(peaks, semilla, dwi_affine, tamaño_paso, angulo_maximo, max_pasos, mascara, invertir=True)
+    trayectoria_backward = trayectoria_backward[::-1]
+    # Evitar duplicar la semilla
+    if trayectoria_backward and np.array_equal(np.array(trayectoria_backward[-1]), np.array(semilla)):
+        trayectoria_backward = trayectoria_backward[:-1]
+    trayectoria_completa = trayectoria_backward + trayectoria_forward
+    return trayectoria_completa
+
+def calcular_longitud(streamline, dwi_affine):
+    #Calcular la longitud fisica de los streamlines
+    # Convertir cada punto a coordenadas físicas
+    puntos_fisicos = [nib.affines.apply_affine(dwi_affine, np.array(p)) for p in streamline]
+    longitud = 0
+    # Sumar las distancias Euclidianas entre puntos consecutivos
+    for i in range(1, len(puntos_fisicos)):
+        longitud += np.linalg.norm(np.array(puntos_fisicos[i]) - np.array(puntos_fisicos[i-1]))
+    return longitud
 
 
 # 7. Bucle principal para generar la trayectoria total
 trayectorias = []
-max_semilla_intentos = 100
+max_semilla_intentos = 30
 intentos_en_semilla = 0
-
-max_semilla_intentos = 30  # Limitar intentos para evitar loops infinitos
-intentos_en_semilla = 0
-semillas_exploradas = set()
+longitud_acumulada = 0
 
 while longitud_acumulada < longitud_minima:
     if intentos_en_semilla >= max_semilla_intentos:
         print("Número máximo de semillas intentadas alcanzado. Terminando.")
-        break  # Detiene el proceso si no hay semillas útiles después de muchos intentos.
+        break #detener el proceso si no hay semillas utiles
 
-    # Elegir una nueva semilla si es necesario
+    #Elegir nueva semilla si es necesario
+
     if tuple(semilla_actual) in semillas_exploradas:
         print(f"Semilla ya explorada: {semilla_actual}. Buscando otra.")
         intentos_en_semilla += 1
         semilla_actual = coordenadas[np.random.randint(0, len(coordenadas))]
         continue
 
-    # Verificar si la semilla está dentro de la máscara
     if mascara[tuple(semilla_actual)] == 0:
         print("Semilla fuera de la máscara. Buscando otra.")
         intentos_en_semilla += 1
         semilla_actual = coordenadas[np.random.randint(0, len(coordenadas))]
         continue
 
-    semillas_exploradas.add(tuple(semilla_actual))  # Guardar semilla para evitar repetirla
-
-    # Obtener la dirección inicial para la propagación
-    direccion_principal = interpolar_direcciones(picos, np.array(semilla_actual, dtype=float))
-
-    if direccion_principal is not None:
-        print(f"Probando trayectoria con la semilla {semilla_actual}...")
-
-        trayectoria, longitud_acumulada = realizar_trayectoria(
-            peaks=picos,
-            semilla=semilla_actual,
-            dwi_affine=dwi_affine,
-            tamaño_paso=tamaño_paso,
-            angulo_maximo=angulo_maximo,
-            longitud_maxima=longitud_maxima,
-            mascara=mascara
-        )
-
+    semillas_exploradas.add(tuple(semilla_actual)) # Guardar semilla para evitar repetirla
+    
+    print(f"Probando trayectoria bidireccional con la semilla {semilla_actual}")
+    trayectoria = realizar_trayectoria_bidireccional(
+        peaks=picos,
+        semilla=semilla_actual,
+        dwi_affine=dwi_affine,
+        tamaño_paso=tamaño_paso,
+        angulo_maximo=angulo_maximo,
+        max_pasos=max_pasos,
+        mascara=mascara
+    )
+    
+    if trayectoria:
+        longitud_acumulada = calcular_longitud(trayectoria, dwi_affine)
         if longitud_acumulada >= longitud_minima:
-            print(f" Trayectoria válida generada con longitud {longitud_acumulada:.2f} mm.")
+            print(f"Trayectoria válida generada con longitud {longitud_acumulada:.2f} mm.")
             trayectorias.append(trayectoria)
-            break  #  Salimos del bucle porque ya encontramos una trayectoria válida
-
+            break #Salimos del bucle porque ya se encontró trayectoria valida
         else:
-            print(f" Trayectoria demasiado corta ({longitud_acumulada:.2f} mm). Probando expansión...")
+            print(f"Trayectoria demasiado corta ({longitud_acumulada:.2f} mm). Probando otra semilla.")
+    else:
+        print("No se pudo generar una trayectoria desde esta semilla. Buscando otra.")
 
-            #  Intentar otro vector en la misma semilla antes de rendirse
-            normas = np.linalg.norm(picos[tuple(np.round(semilla_actual).astype(int))], axis=1)
-            if np.max(normas) > 1e-3:
-                mejor_direccion = picos[tuple(np.round(semilla_actual).astype(int))][np.argmax(normas)]
-                direccion_principal = mejor_direccion / np.linalg.norm(mejor_direccion)
-                print(" Probando otra propagación desde la misma semilla...")
-                continue  # Volver a intentar con una nueva dirección en la misma semilla
-            else:
-                print(" No se encontró dirección válida en la semilla. Buscando nueva semilla.")
-
-    # Si la propagación no funciona, cambiar de semilla
     intentos_en_semilla += 1
     semilla_actual = coordenadas[np.random.randint(0, len(coordenadas))]
 
 print("Fin de la búsqueda de semillas.")
 
-# Guardar trayectorias si se generaron
+
+# 8. Guardar la trayectoria generada (o trayectorias, según se requiera)
 if trayectorias:
     streamlines = Streamlines([np.array([nib.affines.apply_affine(dwi_affine, punto) for punto in t]) for t in trayectorias])
     sft = StatefulTractogram(streamlines, nib.Nifti1Image(dwi_datos, dwi_affine), Space.RASMM)
