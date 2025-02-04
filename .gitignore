@@ -1,2 +1,6 @@
 #Ignore 
 *.tck
+*.nii
+Tesis/Articulos
+*.pdf
+*.txt
