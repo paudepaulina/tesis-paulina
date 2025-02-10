@@ -5,7 +5,7 @@ from dipy.tracking.streamline import Streamlines
 from dipy.io.stateful_tractogram import StatefulTractogram, Space
 
 # 1. Cargar datos 
-archivo_mascara = "mascara_CP_intento_4.nii"
+archivo_mascara = "/home/paulinabr/Escritorio/Tesis/Picos archivos/mascara_redimensionada.nii.gz"
 archivo_picos = "/home/paulinabr/Escritorio/Tesis/Picos archivos/peaks_correcto.nii.gz"
 archivo_dwi = "ISMRM_2023_b3000.nii"
 
@@ -21,11 +21,11 @@ print(f"Dimensiones de los datos dwi: {dwi_datos.shape}")
 
 # 2. Parámetros de propagación
 
-tamaño_paso   = 0.5    # Tamaño del paso 
+tamaño_paso = 0.5    # Tamaño del paso 
 angulo_maximo = 60     # Ángulo máximo 
 longitud_minima = 10   # Longitud mínima en mm
-longitud_maxima = 20   # Longitud máxima en mm
-max_pasos = 500        # Número máximo de pasos por trayectoria
+longitud_maxima = 100   # Longitud máxima en mm
+max_pasos = 100       # Número máximo de pasos por trayectoria
 
 # 3. Funciones
 
@@ -78,7 +78,7 @@ def calcular_angulo(v1, v2):
     cos_angulo = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
     return np.degrees(np.arccos(np.clip(cos_angulo, -1, 1)))
 
-def propagar_trayectoria(peaks, semilla, dwi_affine, tamaño_paso, angulo_maximo, max_pasos, mascara, invertir=False):
+def propagar_trayectoria(peaks, semilla, dwi_affine, tamaño_paso, angulo_maximo, max_pasos, dwi_shape, invertir=False):
     
     trayectoria = [semilla]
     posicion_actual = np.array(semilla, dtype=float)
@@ -91,24 +91,37 @@ def propagar_trayectoria(peaks, semilla, dwi_affine, tamaño_paso, angulo_maximo
             break
         if invertir:
             direccion = -direccion
+        
+        #Calcular nuevo punto en espacio dwi
+        nuevo_punto = posicion_actual + tamaño_paso *direccion
+        nuevo_voxel = np.round(nuevo_punto).astype(int)
+
+        #Validar dentro del volumen DWI no solo de la máscara
+        if not all(0<= nuevo_voxel[i] < dwi_shape[i] for i in range(3)):
+            print(f"Punto fuera del volumen DWI: {nuevo_voxel}")
+            break
+
+        #Convertir a espacio fisico para verificar distancia
+        posicion_fisica = nib.affines.apply_affine(dwi_affine, nuevo_punto)
+
         if direccion_actual is not None:
             angulo = calcular_angulo(direccion_actual, direccion)
             if angulo > angulo_maximo:
                 break
-        nuevo_punto = posicion_actual + tamaño_paso * direccion
-        nuevo_voxel = np.round(nuevo_punto).astype(int)
-        if not (0 <= nuevo_voxel[0] < mascara.shape[0] and 
-                0 <= nuevo_voxel[1] < mascara.shape[1] and 
-                0 <= nuevo_voxel[2] < mascara.shape[2]) or mascara[tuple(nuevo_voxel)] == 0:
-            break
+        #nuevo_punto = posicion_actual + tamaño_paso * direccion
+        #nuevo_voxel = np.round(nuevo_punto).astype(int)
+        #if not (0 <= nuevo_voxel[0] < mascara.shape[0] and 
+        #        0 <= nuevo_voxel[1] < mascara.shape[1] and 
+        #        0 <= nuevo_voxel[2] < mascara.shape[2]) or mascara[tuple(nuevo_voxel)] == 0:
+        #    break
         trayectoria.append(nuevo_punto.tolist())
         posicion_actual = nuevo_punto
         direccion_actual = direccion
     return trayectoria
 
-def realizar_trayectoria_bidireccional(peaks, semilla, dwi_affine, tamaño_paso, angulo_maximo, max_pasos, mascara):
-    trayectoria_forward = propagar_trayectoria(peaks, semilla, dwi_affine, tamaño_paso, angulo_maximo, max_pasos, mascara, invertir=False)
-    trayectoria_backward = propagar_trayectoria(peaks, semilla, dwi_affine, tamaño_paso, angulo_maximo, max_pasos, mascara, invertir=True)
+def realizar_trayectoria_bidireccional(peaks, semilla, dwi_affine, tamaño_paso, angulo_maximo, max_pasos, dwi_shape):
+    trayectoria_forward = propagar_trayectoria(peaks, semilla, dwi_affine, tamaño_paso, angulo_maximo, max_pasos, dwi_shape, invertir=False)
+    trayectoria_backward = propagar_trayectoria(peaks, semilla, dwi_affine, tamaño_paso, angulo_maximo, max_pasos, dwi_shape, invertir=True)
     trayectoria_backward = trayectoria_backward[::-1]
     if trayectoria_backward and np.array_equal(np.array(trayectoria_backward[-1]), np.array(semilla)):
         trayectoria_backward = trayectoria_backward[:-1]
@@ -129,7 +142,7 @@ for i, semilla in enumerate(semillas):
         tamaño_paso=tamaño_paso,
         angulo_maximo=angulo_maximo,
         max_pasos=max_pasos,
-        mascara=mascara
+        dwi_shape=dwi_datos.shape
     )
     if trayectoria:
         longitud = calcular_longitud(trayectoria, dwi_affine)
