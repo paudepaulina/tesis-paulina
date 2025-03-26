@@ -4,163 +4,218 @@ from dipy.io.streamline import save_tck
 from dipy.tracking.streamline import Streamlines
 from dipy.io.stateful_tractogram import StatefulTractogram, Space
 
-# 1. Cargar datos 
-archivo_mascara = "/home/paulinabr/Escritorio/Tesis/Picos archivos/mascara_redimensionada.nii.gz"
-archivo_picos = "/home/paulinabr/Escritorio/Tesis/Picos archivos/peaks_correcto.nii.gz"
-archivo_dwi = "ISMRM_2023_b3000.nii"
+# 1. Carga de datos
+archivo_mascara = "/home/paulinabr/Escritorio/Tesis/Picos archivos/mascara_redimensionada.nii.gz"  # máscara binaria de semillas
+archivo_picos  = "/home/paulinabr/Escritorio/Tesis/peaks_mrtrix.nii"                           # modificacion: Uso de archivo peaks mrtrix
+archivo_dwi    = "ISMRM_2023_b3000.nii"                                                         # volumen DWI original
 
+# Leer los picos en forma: 90×108×90×9
 picos = nib.load(archivo_picos).get_fdata()
-mascara = nib.load(archivo_mascara).get_fdata()
-dwi_datos = nib.load(archivo_dwi).get_fdata()
-dwi_affine = nib.load(archivo_dwi).affine
 
-print("Se cargaron los datos")
+# Leer la máscara 
+mascara = nib.load(archivo_mascara).get_fdata()
+
+# Cargar el volumen DWI completo y extraer datos + matriz affine
+dwi_img    = nib.load(archivo_dwi)
+dwi_datos  = dwi_img.get_fdata()     # datos DWI (90×108×90×65)
+dwi_affine = dwi_img.affine          # affine voxel a físico
+
+# Mostrar dimensiones para confirmar que todo coincide
 print(f"Dimensiones de picos: {picos.shape}")
 print(f"Dimensiones de máscara: {mascara.shape}")
-print(f"Dimensiones de los datos dwi: {dwi_datos.shape}")
+print(f"Dimensiones DWI: {dwi_datos.shape}")
 
 # 2. Parámetros de propagación
+tamaño_paso    = 0.5    # mm a avanzar en cada iteración
+angulo_maximo  = 60     # máximo giro permitido entre pasos (grados)
+longitud_minima = 10    # longitud mínima aceptable de una fibra (mm)
+max_pasos      = 100    # límite de pasos para cada trayectoria
 
-tamaño_paso = 0.5    # Tamaño del paso 
-angulo_maximo = 60     # Ángulo máximo 
-longitud_minima = 10   # Longitud mínima en mm
-longitud_maxima = 100   # Longitud máxima en mm
-max_pasos = 500       # Número máximo de pasos por trayectoria
 
-# 3. Funciones
+# 3. Funciones auxiliares 
+def calcular_longitud(streamline, affine):
+   #Calcula la longitud total de la trayectoria (streamline) en milímetros
+   
+    # Transformar cada punto de voxel a coordenadas físicas (mm)
+    pts = [nib.affines.apply_affine(affine, p) for p in streamline]
+    # Sumar las distancias euclídeas entre cada par de puntos consecutivos
+    return sum(
+        np.linalg.norm(pts[i] - pts[i-1])
+        for i in range(1, len(pts))
+    )
 
-# Calculando la longitud de la trayectoria
+def extraer_3vectores(voxel):
+    
+    #Toma un array de 9 valores (un voxel de picos) y lo convierte en 3 vectores 3D.
+    #Se asume que están ordenados como:
+    #  [x1, y1, z1, x2, y2, z2, x3, y3, z3]
+    
+    return np.vstack((
+        voxel[0:3],  # primer vector
+        voxel[3:6],  # segundo vector
+        voxel[6:9]   # tercer vector
+    ))
 
-def calcular_longitud(streamline, dwi_affine):
-    puntos_fisicos = [nib.affines.apply_affine(dwi_affine, np.array(p)) for p in streamline]
-    longitud = 0
-    for i in range(1, len(puntos_fisicos)):
-        longitud += np.linalg.norm(np.array(puntos_fisicos[i]) - np.array(puntos_fisicos[i-1]))
-    return longitud
+def interpolar_direcciones(peaks, pos_vox):
+    # Convertir coordenadas continuas a índices enteros de voxel
+    x0, y0, z0 = map(int, pos_vox)
 
-# Funciones de interpolación y propagación bidireccional:
-
-def interpolar_direcciones(peaks, posicion):
-    x, y, z = posicion
-    x0, y0, z0 = int(x), int(y), int(z)
-    if not (0 <= x0 < peaks.shape[0] - 1 and 0 <= y0 < peaks.shape[1] - 1 and 0 <= z0 < peaks.shape[2] - 1):
+    # Si estamos fuera del volumen o muy cerca del borde no hay dirección válida
+    if not (0 <= x0 < peaks.shape[0]-1 
+            and 0 <= y0 < peaks.shape[1]-1 
+            and 0 <= z0 < peaks.shape[2]-1):
         return None
+
+    # Extraer el bloque 2×2×2 de voxeles vecinos 
     vecinos = peaks[x0:x0+2, y0:y0+2, z0:z0+2]
-    norm = np.linalg.norm(vecinos, axis=-1)
-    max_indices = np.argmax(norm, axis=-1)
-    vectores_principales = np.zeros((2,2,2,3))
+
+    # Preparar matriz para almacenar la dirección dominante en cada esquina
+    vects = np.zeros((2,2,2,3))
+
+    # Para cada esquina del cubo 2×2×2:
     for i in range(2):
         for j in range(2):
             for k in range(2):
-                vectores_principales[i,j,k] = vecinos[i,j,k, max_indices[i,j,k]]
-    if np.all(np.linalg.norm(vectores_principales, axis=-1) == 0):
-        normas = np.linalg.norm(peaks[x0, y0, z0], axis=1)
-        if np.max(normas) > 1e-3:
-            mejor_direccion = peaks[x0, y0, z0, np.argmax(normas)]
-            return mejor_direccion / np.linalg.norm(mejor_direccion)
+                # Convertir los 9 valores del voxel a 3 vectores de 3 componentes
+                vols = extraer_3vectores(vecinos[i,j,k])
+                # Calcular la magnitud de cada vector
+                norms = np.linalg.norm(vols, axis=1)
+                # Si alguno es significativo, quedarnos con el de mayor norma
+                if norms.max() > 1e-3:
+                    vects[i,j,k] = vols[np.argmax(norms)]
+
+    # Si todas las esquinas no tienen dirección válida, terminar
+    if np.allclose(vects, 0):
         return None
+
+    # Calcular desplazamientos fraccionales dentro del voxel base
+    dx, dy, dz = pos_vox - np.array([x0, y0, z0])
+
+    # Construir los 8 pesos de interpolación trilineal
     pesos = np.array([
-        (1 - (x - x0)) * (1 - (y - y0)) * (1 - (z - z0)),
-        (x - x0) * (1 - (y - y0)) * (1 - (z - z0)),
-        (1 - (x - x0)) * (y - y0) * (1 - (z - z0)),
-        (1 - (x - x0)) * (1 - (y - y0)) * (z - z0),
-        (x - x0) * (y - y0) * (1 - (z - z0)),
-        (1 - (x - x0)) * (y - y0) * (z - z0),
-        (x - x0) * (1 - (y - y0)) * (z - z0),
-        (x - x0) * (y - y0) * (z - z0)
+        [(1-dx)*(1-dy)*(1-dz), (1-dx)*(1-dy)*dz],
+        [(1-dx)*dy*(1-dz),     (1-dx)*dy*dz],
+        [dx*(1-dy)*(1-dz),     dx*(1-dy)*dz],
+        [dx*dy*(1-dz),         dx*dy*dz]
     ]).reshape(2,2,2,1)
-    direccion_interpolada = np.sum(vectores_principales * pesos, axis=(0,1,2))
-    if np.linalg.norm(direccion_interpolada) > 0:
-        return direccion_interpolada / np.linalg.norm(direccion_interpolada)
+
+    # Interpolar sumando vectores ponderados
+    dir_interp = np.sum(vects * pesos, axis=(0,1,2))
+
+    # Normalizar para obtener dirección unitaria
+    norm = np.linalg.norm(dir_interp)
+    if norm > 1e-9:
+        return dir_interp / norm
+
     return None
 
 def calcular_angulo(v1, v2):
-    cos_angulo = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
-    return np.degrees(np.arccos(np.clip(cos_angulo, -1, 1)))
+    return np.degrees(np.arccos(np.clip(np.dot(v1,v2)/(np.linalg.norm(v1)*np.linalg.norm(v2)), -1, 1)))
 
-def propagar_trayectoria(peaks, semilla, dwi_affine, tamaño_paso, angulo_maximo, max_pasos, dwi_shape, invertir=False):
+# 4. Propagación en espacio físico
+
+def propagar_trayectoria(peaks, semilla, tamaño_paso, angulo_max, max_pasos, dwi_affine, dwi_shape, invertir=False):
+
+
+    # Inicializar la trayectoria con la posición de la semilla (en mm)
+    pos_mm = nib.affines.apply_affine(dwi_affine, semilla)
+    dir_prev = None                     # No hay dirección previa aún
+    trayectoria = [pos_mm.tolist()]     # Lista de puntos físicos
     
-    trayectoria = [semilla]
-    posicion_actual = np.array(semilla, dtype=float)
-    direccion_actual = None
+    # Precomputar la matriz inversa para pasar de espacio físico a voxel
+    inv_affine = np.linalg.inv(dwi_affine)
+    
+    for paso in range(max_pasos):
+        # Convertir la posición física actual a coordenadas continuas de voxel
+        pos_vox = nib.affines.apply_affine(inv_affine, pos_mm)
 
-    for _ in range(max_pasos):
-        # Usar la posición continua para la interpolación
-        direccion = interpolar_direcciones(peaks, posicion_actual)
+        # Obtener la dirección interpolada a partir de los picos en ese voxel
+        direccion = interpolar_direcciones(peaks, pos_vox)
         if direccion is None:
-            break
-        if invertir:
-            direccion = -direccion
-        
-        #Calcular nuevo punto en espacio dwi
-        nuevo_punto = posicion_actual + tamaño_paso *direccion
-        nuevo_voxel = np.round(nuevo_punto).astype(int)
-
-        #Validar dentro del volumen DWI no solo de la máscara
-        if not all(0<= nuevo_voxel[i] < dwi_shape[i] for i in range(3)):
-            print(f"Punto fuera del volumen DWI: {nuevo_voxel}")
+            # No hay dirección válida = terminar trayectoria
             break
 
-        #Convertir a espacio fisico para verificar distancia
-        posicion_fisica = nib.affines.apply_affine(dwi_affine, nuevo_punto)
+        #  Primer paso: invertir sólo en primer punto
+        if dir_prev is None:
+            if invertir:
+                direccion = -direccion
+        else:
+            #  Pasos siguientes: usar producto punto para decidir inversión 
+            if np.dot(direccion, dir_prev) < 0:
+                direccion = -direccion
 
-        if direccion_actual is not None:
-            angulo = calcular_angulo(direccion_actual, direccion)
-            if angulo > angulo_maximo:
+            #  Controlar giro brusco: si supera ángulo máximo, cortar
+            if calcular_angulo(dir_prev, direccion) > angulo_max:
                 break
-        #nuevo_punto = posicion_actual + tamaño_paso * direccion
-        #nuevo_voxel = np.round(nuevo_punto).astype(int)
-        #if not (0 <= nuevo_voxel[0] < mascara.shape[0] and 
-        #        0 <= nuevo_voxel[1] < mascara.shape[1] and 
-        #        0 <= nuevo_voxel[2] < mascara.shape[2]) or mascara[tuple(nuevo_voxel)] == 0:
-        #    break
-        trayectoria.append(nuevo_punto.tolist())
-        posicion_actual = nuevo_punto
-        direccion_actual = direccion
+
+        # Avanzar la posición en espacio físico
+        pos_mm = pos_mm + tamaño_paso * direccion
+
+        # Redondear a voxel y verificar que esté dentro del volumen
+        vox_round = np.round(nib.affines.apply_affine(inv_affine, pos_mm)).astype(int)
+        if not np.all((vox_round >= 0) & (vox_round < dwi_shape[:3])):
+            # Punto fuera del volumen =terminar trayectoria
+            break
+
+        # Añadir nuevo punto a la trayectoria y actualizar dirección previa
+        trayectoria.append(pos_mm.tolist())
+        dir_prev = direccion
+
     return trayectoria
 
-def realizar_trayectoria_bidireccional(peaks, semilla, dwi_affine, tamaño_paso, angulo_maximo, max_pasos, dwi_shape):
-    trayectoria_forward = propagar_trayectoria(peaks, semilla, dwi_affine, tamaño_paso, angulo_maximo, max_pasos, dwi_shape, invertir=False)
-    trayectoria_backward = propagar_trayectoria(peaks, semilla, dwi_affine, tamaño_paso, angulo_maximo, max_pasos, dwi_shape, invertir=True)
-    trayectoria_backward = trayectoria_backward[::-1]
-    if trayectoria_backward and np.array_equal(np.array(trayectoria_backward[-1]), np.array(semilla)):
-        trayectoria_backward = trayectoria_backward[:-1]
-    trayectoria_completa = trayectoria_backward + trayectoria_forward
-    return trayectoria_completa
 
-# 4. Bucle para generar trayectoria total
-semillas = np.argwhere(mascara == 1)
-print(f"Total de semillas en la máscara: {len(semillas)}")
 
-trayectorias = []
-for i, semilla in enumerate(semillas):
-    print(f"Generando trayectoria para semilla {i+1}/{len(semillas)}: {semilla}")
-    trayectoria = realizar_trayectoria_bidireccional(
-        peaks=picos,
-        semilla=semilla,
-        dwi_affine=dwi_affine,
-        tamaño_paso=tamaño_paso,
-        angulo_maximo=angulo_maximo,
-        max_pasos=max_pasos,
-        dwi_shape=dwi_datos.shape
+def realizar_trayectoria_bidireccional(peaks, semilla, tamaño_paso, angulo_max, max_pasos, dwi_shape):
+    
+    #Genera una trayectoria completa bidireccional desde una semilla:
+    #  - Primero propaga hacia adelante (invertir=False)
+    #  - Luego propaga hacia atrás (invertir=True)
+    #  - Une ambas trayectorias sin duplicar la semilla
+    
+    # Propagación hacia adelante desde la semilla
+    fwd = propagar_trayectoria(
+        peaks, semilla, tamaño_paso, angulo_max, max_pasos, dwi_affine, dwi_shape, invertir=False
     )
-    if trayectoria:
-        longitud = calcular_longitud(trayectoria, dwi_affine)
-        if longitud >= longitud_minima:
-            trayectorias.append(trayectoria)
-            print(f"Trayectoria válida generada (longitud: {longitud:.2f} mm).")
-        else:
-            print(f"Trayectoria demasiado corta (longitud: {longitud:.2f} mm).")
-    else:
-        print("No se pudo generar trayectoria para esta semilla.")
 
-print(f"Se generaron {len(trayectorias)} trayectorias válidas.")
+    # Propagación hacia atrás, luego invertimos el orden 
+    bwd = propagar_trayectoria(
+        peaks, semilla, tamaño_paso, angulo_max, max_pasos, dwi_affine, dwi_shape, invertir=True
+    )[::-1]
 
-#  5. Guardar las trayectorias 
+    # Si la última posición de la trayectoria backward coincide con la semilla, la quitamos
+    if bwd and np.allclose(bwd[-1], nib.affines.apply_affine(dwi_affine, semilla)):
+        bwd.pop()
+
+    # Concatenamos backward + forward para obtener la trayectoria completa
+    return bwd + fwd
+
+
+# 5. Generar y filtrar trayectorias
+semillas = np.argwhere(mascara)  # Todas las coordenadas donde máscara==1
+trayectorias = []
+
+# Contador para llevar el progreso
+total_semillas = len(semillas)
+
+for idx, s in enumerate(semillas):
+    print(f"Generando trayectoria para semilla {idx+1}/{total_semillas}: {s}")
+    traj = realizar_trayectoria_bidireccional(
+        picos, s, tamaño_paso, angulo_maximo, max_pasos, dwi_datos.shape
+    )
+    # Solo conservar trayectorias cuya longitud supere el umbral mínimo
+    if traj and calcular_longitud(traj, dwi_affine) >= longitud_minima:
+        trayectorias.append(traj)
+
+print(f"Trayectorias válidas: {len(trayectorias)}")
+
+# 6. Guardar en TCK
 if trayectorias:
-    streamlines = Streamlines([np.array([nib.affines.apply_affine(dwi_affine, p) for p in t]) for t in trayectorias])
+    # Convertir cada trayectoria a array (ya están en espacio físico)
+    streamlines = Streamlines([np.array(t) for t in trayectorias])
+
+    # Crear tractograma en espacio RASMM (coordenadas físicas) y guardar
     sft = StatefulTractogram(streamlines, nib.Nifti1Image(dwi_datos, dwi_affine), Space.RASMM)
     save_tck(sft, "Trayectorias_finales.tck")
-    print("Trayectorias guardadas con éxito.")
+    print("Guardado exitoso.")
 else:
-    print("No se generaron trayectorias válidas.")
+    print("No hay trayectorias para guardar.")
