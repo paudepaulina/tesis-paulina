@@ -116,7 +116,6 @@ def calcular_angulo(v1, v2):
 
 def propagar_trayectoria(peaks, semilla, tamaño_paso, angulo_max, max_pasos, dwi_affine, dwi_shape, invertir=False):
 
-
     # Inicializar la trayectoria con la posición de la semilla (en mm)
     pos_mm = nib.affines.apply_affine(dwi_affine, semilla)
     dir_prev = None                     # No hay dirección previa aún
@@ -135,20 +134,20 @@ def propagar_trayectoria(peaks, semilla, tamaño_paso, angulo_max, max_pasos, dw
             # No hay dirección válida = terminar trayectoria
             break
 
-        #  Primer paso: invertir sólo en primer punto
+        # invertir sólo en primer punto
         if dir_prev is None:
             if invertir:
                 direccion = -direccion
         else:
-            #  Pasos siguientes: usar producto punto para decidir inversión 
+            #  usar producto punto para decidir inversión 
             if np.dot(direccion, dir_prev) < 0:
                 direccion = -direccion
 
-            #  Controlar giro brusco: si supera ángulo máximo, cortar
+            #  si supera ángulo máximo, cortar
             if calcular_angulo(dir_prev, direccion) > angulo_max:
                 break
 
-        # Avanzar la posición en espacio físico
+        # Avanzar la posición en espacio físico; Ecuación de propagación
         pos_mm = pos_mm + tamaño_paso * direccion
 
         # Redondear a voxel y verificar que esté dentro del volumen
